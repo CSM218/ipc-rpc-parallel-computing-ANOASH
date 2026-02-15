@@ -1,10 +1,13 @@
 package pdc;
 
+import java.io.BufferedInputStream;
+import java.io.BufferedOutputStream;
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.IOException;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.net.SocketException;
 import java.net.SocketTimeoutException;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
@@ -13,6 +16,7 @@ import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
@@ -30,6 +34,9 @@ public class Master {
     private final ConcurrentHashMap<String, String> taskResults = new ConcurrentHashMap<>();
     private final AtomicInteger taskCounter = new AtomicInteger(0);
     private String studentId;
+    private static final int BUFFER_SIZE = 65536;
+    private static final long TASK_TIMEOUT_MS = 3000;
+    private static final long HEARTBEAT_TIMEOUT_MS = 5000;
 
     public Master() {
         this.studentId = System.getenv("STUDENT_ID");
@@ -42,20 +49,21 @@ public class Master {
     }
 
     public Object coordinate(String operation, int[][] data, int workerCount) {
-        List<WorkerConnection> available = new ArrayList<>(workers.values());
+        List<WorkerConnection> available = getAliveWorkers();
         if (available.isEmpty()) {
             return null;
         }
 
         int size = data.length;
-        int blockSize = Math.max(1, size / Math.max(1, available.size()));
+        int numWorkers = Math.max(1, available.size());
+        int blockSize = Math.max(1, (size + numWorkers - 1) / numWorkers);
         List<TaskInfo> tasks = new ArrayList<>();
 
         for (int i = 0; i < size; i += blockSize) {
             int endRow = Math.min(i + blockSize, size);
             String taskId = "task-" + taskCounter.incrementAndGet();
             String taskData = encodeBlockTask(data, i, endRow);
-            TaskInfo ti = new TaskInfo(taskId, operation, taskData);
+            TaskInfo ti = new TaskInfo(taskId, operation, taskData, i);
             tasks.add(ti);
             pendingTasks.put(taskId, ti);
         }
@@ -64,19 +72,28 @@ public class Master {
             TaskInfo t = tasks.get(i);
             WorkerConnection wc = available.get(i % available.size());
             t.assignedWorker = wc.workerId;
-            submitTask(wc, t);
+            t.retryCount = 0;
+            submitTaskAsync(wc, t);
         }
 
-        long deadline = System.currentTimeMillis() + 30000;
+        long deadline = System.currentTimeMillis() + 60000;
         while (!allTasksComplete(tasks) && System.currentTimeMillis() < deadline) {
-            try { Thread.sleep(50); } catch (InterruptedException ignored) {}
-            reassignFailedTasks(tasks, available);
+            try { Thread.sleep(20); } catch (InterruptedException ignored) { break; }
+            reassignFailedTasks(tasks);
         }
 
         return aggregateResults(data, tasks);
     }
 
-    private void submitTask(WorkerConnection wc, TaskInfo task) {
+    private List<WorkerConnection> getAliveWorkers() {
+        List<WorkerConnection> alive = new ArrayList<>();
+        for (WorkerConnection wc : workers.values()) {
+            if (wc.alive) alive.add(wc);
+        }
+        return alive;
+    }
+
+    private void submitTaskAsync(WorkerConnection wc, TaskInfo task) {
         systemThreads.submit(() -> {
             try {
                 Message req = new Message("RPC_REQUEST", studentId, null);
@@ -96,46 +113,51 @@ public class Master {
         return true;
     }
 
-    private void reassignFailedTasks(List<TaskInfo> tasks, List<WorkerConnection> available) {
+    private void reassignFailedTasks(List<TaskInfo> tasks) {
         long now = System.currentTimeMillis();
+        List<WorkerConnection> alive = getAliveWorkers();
+        if (alive.isEmpty()) return;
+
+        int workerIdx = 0;
         for (TaskInfo t : tasks) {
             if (taskResults.containsKey(t.taskId)) continue;
+
             WorkerConnection assigned = workers.get(t.assignedWorker);
-            boolean needReassign = assigned == null || !assigned.alive || (now - t.sentTime > 5000);
-            if (needReassign) {
-                for (WorkerConnection wc : available) {
-                    if (wc.alive) {
-                        t.assignedWorker = wc.workerId;
-                        submitTask(wc, t);
-                        break;
-                    }
-                }
+            boolean workerDead = assigned == null || !assigned.alive;
+            boolean timedOut = (now - t.sentTime) > TASK_TIMEOUT_MS;
+
+            if (workerDead || (timedOut && t.retryCount < 5)) {
+                WorkerConnection newWorker = alive.get(workerIdx % alive.size());
+                workerIdx++;
+                t.assignedWorker = newWorker.workerId;
+                t.retryCount++;
+                submitTaskAsync(newWorker, t);
             }
         }
     }
 
     private int[][] aggregateResults(int[][] original, List<TaskInfo> tasks) {
         int size = original.length;
+        int cols = original.length > 0 ? original[0].length : 0;
         int[][] result = new int[size][];
-        
+
         for (TaskInfo t : tasks) {
             String res = taskResults.get(t.taskId);
-            if (res == null) continue;
+            if (res == null || res.isEmpty()) continue;
             int[][] block = decodeMatrix(res);
-            int startRow = t.startRow;
-            for (int i = 0; i < block.length && (startRow + i) < size; i++) {
-                result[startRow + i] = block[i];
+            for (int i = 0; i < block.length && (t.startRow + i) < size; i++) {
+                result[t.startRow + i] = block[i];
             }
         }
-        
+
         for (int i = 0; i < size; i++) {
-            if (result[i] == null) result[i] = new int[size];
+            if (result[i] == null) result[i] = new int[cols];
         }
         return result;
     }
 
     private String encodeBlockTask(int[][] data, int startRow, int endRow) {
-        StringBuilder sb = new StringBuilder();
+        StringBuilder sb = new StringBuilder(data.length * data[0].length * 4);
         for (int i = startRow; i < endRow; i++) {
             for (int j = 0; j < data[i].length; j++) {
                 sb.append(data[i][j]);
@@ -155,9 +177,14 @@ public class Master {
     }
 
     private int[][] decodeMatrix(String str) {
+        if (str == null || str.isEmpty()) return new int[0][0];
         String[] rows = str.split(";");
         int[][] mat = new int[rows.length][];
         for (int i = 0; i < rows.length; i++) {
+            if (rows[i].isEmpty()) {
+                mat[i] = new int[0];
+                continue;
+            }
             String[] vals = rows[i].split(",");
             mat[i] = new int[vals.length];
             for (int j = 0; j < vals.length; j++) {
@@ -167,22 +194,10 @@ public class Master {
         return mat;
     }
 
-    private int[][] multiplyLocal(int[][] data) {
-        int n = data.length;
-        int[][] result = new int[n][n];
-        for (int i = 0; i < n; i++) {
-            for (int j = 0; j < n; j++) {
-                for (int k = 0; k < n; k++) {
-                    result[i][j] += data[i][k] * data[k][j];
-                }
-            }
-        }
-        return result;
-    }
-
     public void listen(int port) throws IOException {
         serverSocket = new ServerSocket(port);
-        serverSocket.setSoTimeout(1000);
+        serverSocket.setSoTimeout(500);
+        serverSocket.setReceiveBufferSize(BUFFER_SIZE);
         running.set(true);
         System.out.println("Master listening on port " + port);
 
@@ -190,6 +205,8 @@ public class Master {
             while (running.get()) {
                 try {
                     Socket client = serverSocket.accept();
+                    client.setTcpNoDelay(true);
+                    client.setSoTimeout(30000);
                     systemThreads.submit(() -> handleConnection(client));
                 } catch (SocketTimeoutException ignored) {
                 } catch (IOException e) {
@@ -205,8 +222,8 @@ public class Master {
 
     private void handleConnection(Socket client) {
         try {
-            DataInputStream in = new DataInputStream(client.getInputStream());
-            DataOutputStream out = new DataOutputStream(client.getOutputStream());
+            DataInputStream in = new DataInputStream(new BufferedInputStream(client.getInputStream(), BUFFER_SIZE));
+            DataOutputStream out = new DataOutputStream(new BufferedOutputStream(client.getOutputStream(), BUFFER_SIZE));
 
             int len = in.readInt();
             byte[] data = new byte[len];
@@ -223,14 +240,14 @@ public class Master {
             if ("REGISTER_WORKER".equals(msg.messageType)) {
                 String workerId = msg.studentId;
                 String token = UUID.randomUUID().toString().substring(0, 8);
-                
+
                 WorkerConnection wc = new WorkerConnection(workerId, client, in, out, token);
                 workers.put(workerId, wc);
-                
+
                 Message ack = new Message("WORKER_ACK", studentId, null);
                 ack.setPayloadFromString(token);
                 wc.send(ack);
-                
+
                 System.out.println("Worker registered: " + workerId);
                 listenToWorker(wc);
             }
@@ -244,12 +261,16 @@ public class Master {
             while (running.get() && wc.alive) {
                 try {
                     int len = wc.in.readInt();
+                    if (len <= 0 || len > 100_000_000) {
+                        wc.alive = false;
+                        break;
+                    }
                     byte[] data = new byte[len];
                     wc.in.readFully(data);
                     Message msg = Message.unpack(data);
-                    
+
                     if (msg == null) continue;
-                    
+
                     switch (msg.messageType) {
                         case "TASK_COMPLETE":
                             String payload = msg.getPayloadAsString();
@@ -271,21 +292,25 @@ public class Master {
                             wc.capabilities = msg.getPayloadAsString();
                             break;
                     }
+                } catch (SocketException e) {
+                    wc.alive = false;
+                    break;
                 } catch (Exception e) {
                     wc.alive = false;
                     break;
                 }
             }
             workers.remove(wc.workerId);
+            try { wc.socket.close(); } catch (IOException ignored) {}
         });
     }
 
     private void heartbeatLoop() {
         while (running.get()) {
             try {
-                Thread.sleep(2000);
+                Thread.sleep(1000);
                 reconcileState();
-            } catch (InterruptedException ignored) {}
+            } catch (InterruptedException ignored) { break; }
         }
     }
 
@@ -301,8 +326,9 @@ public class Master {
                 wc.send(hb);
             } catch (Exception e) {
                 wc.alive = false;
+                workers.remove(wc.workerId);
             }
-            if (now - wc.lastHeartbeat > 10000) {
+            if (now - wc.lastHeartbeat > HEARTBEAT_TIMEOUT_MS) {
                 wc.alive = false;
                 workers.remove(wc.workerId);
             }
@@ -349,6 +375,7 @@ public class Master {
         String capabilities;
         volatile boolean alive = true;
         volatile long lastHeartbeat;
+        final Object sendLock = new Object();
 
         WorkerConnection(String workerId, Socket socket, DataInputStream in, DataOutputStream out, String token) {
             this.workerId = workerId;
@@ -359,11 +386,13 @@ public class Master {
             this.lastHeartbeat = System.currentTimeMillis();
         }
 
-        synchronized void send(Message msg) throws IOException {
-            byte[] data = msg.pack();
-            out.writeInt(data.length);
-            out.write(data);
-            out.flush();
+        void send(Message msg) throws IOException {
+            synchronized (sendLock) {
+                byte[] data = msg.pack();
+                out.writeInt(data.length);
+                out.write(data);
+                out.flush();
+            }
         }
     }
 
@@ -374,11 +403,13 @@ public class Master {
         String assignedWorker;
         long sentTime;
         int startRow;
+        int retryCount;
 
-        TaskInfo(String taskId, String operation, String data) {
+        TaskInfo(String taskId, String operation, String data, int startRow) {
             this.taskId = taskId;
             this.operation = operation;
             this.data = data;
+            this.startRow = startRow;
         }
     }
 }
